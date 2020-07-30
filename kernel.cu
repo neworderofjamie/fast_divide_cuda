@@ -81,21 +81,20 @@ __global__ void validateFastDivide(const uint32_t *d_D, const uint32_t *d_A, con
 
     if(id < numThreads) {
         const uint32_t x = (id * threadStep) + 1;
+    
+        const uint32_t a = d_A[id];
+        const uint32_t b = d_B[id];
+        const uint32_t m = d_M[id];
+        
 
         // Loop through arrays
         for(unsigned int i = 0; i < count; i++) {
-            const uint32_t divide = x / d_D[i];
+            const uint32_t divide = d_D[i] / x;
 
-
-            const uint32_t fastDivideRes = fastDivide(x, d_A[i], d_B[i], d_M[i]);
-            //const uint32_t fastDivide = (((uint64_t)x * d_A[i]) + d_B[i]) >> (32 + d_M[i]);
-
-            //const uint32_t fastDivide = (ax + (d_B[i] >> 32)) >> d_M[i];
-            //const uint32_t fastDivide = (uint32_t)__fdividef(x, d_D[i]);
-            //const uint32_t fastDivide = (uint32_t)(((float)x / (float)d_D[i]) + 0.5f);
-
+            const uint32_t fastDivideRes = fastDivide(d_D[i], a, b, m);
+           
             if(divide != fastDivideRes) {
-                printf("Divide failed for %u / %u = %u (correct answer %u)\n\ta=%u, b=%u, m=%u\n", x, d_D[i], fastDivide, divide, d_A[i], d_B[i], d_M[i]);
+                printf("Divide failed for %u / %u = %u (correct answer %u)\n\ta=%u, b=%u, m=%u\n", d_D[i], x, fastDivide, divide, d_A[i], d_B[i], d_M[i]);
             }
         }
     }
@@ -107,42 +106,52 @@ __global__ void testDivide(const uint32_t *d_D, uint32_t *d_R,
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
 
     if(id < numThreads) {
-        const uint32_t x = id * threadStep;
-
+        const uint32_t x = (id * threadStep) + 1;
+        
         // Loop through arrays and write output
+        uint32_t r = 0;
         for(unsigned int i = 0; i < count; i++) {
-            d_R[(id * numThreads) + i] = x / 13;
+            r += d_D[i] / x;
         }
+        d_R[id] = r;
     }
 }
 //-----------------------------------------------------------------------------
-__global__ void testFastDivideC(const uint32_t *d_A, const uint32_t *d_B, const uint32_t *d_M, uint32_t *d_R,
+__global__ void testFastDivideC(const uint32_t *d_D, const uint32_t *d_A, const uint32_t *d_B, const uint32_t *d_M, uint32_t *d_R,
                                 unsigned int count, unsigned int threadStep, unsigned int numThreads)
 {
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
 
     if(id < numThreads) {
-        const uint32_t x = id * threadStep;
+        const uint32_t a = d_A[id];
+        const uint32_t b = d_B[id];
+        const uint32_t m = d_M[id];
 
         // Loop through arrays
+        uint32_t r = 0;
         for(unsigned int i = 0; i < count; i++) {
-            d_R[(id * numThreads) + i] = (((uint64_t)x * d_A[i]) + d_B[i]) >> (32 + d_M[i]);
+            r += (((uint64_t)d_D[i] * a) + b) >> (32 + m);
         }
+        d_R[id] = r;
     }
 }
 //-----------------------------------------------------------------------------
-__global__ void testFastDividePTX(const uint32_t *d_A, const uint32_t *d_B, const uint32_t *d_M, uint32_t *d_R,
+__global__ void testFastDividePTX(const uint32_t *d_D, const uint32_t *d_A, const uint32_t *d_B, const uint32_t *d_M, uint32_t *d_R,
                                   unsigned int count, unsigned int threadStep, unsigned int numThreads)
 {
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
 
     if(id < numThreads) {
-        const uint32_t x = id * threadStep;
+        const uint32_t a = d_A[id];
+        const uint32_t b = d_B[id];
+        const uint32_t m = d_M[id];
 
         // Loop through arrays
+        uint32_t r = 0;
         for(unsigned int i = 0; i < count; i++) {
-            d_R[(id * numThreads) + i] = fastDivide(x, d_A[i], d_B[i], d_M[i]);
+            r += fastDivide(d_D[i], a, b, m);
         }
+        d_R[id] = r;
     }
 }
 //-----------------------------------------------------------------------------
@@ -152,13 +161,15 @@ __global__ void testFloatDivide(const uint32_t *d_D, uint32_t *d_R,
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
 
     if(id < numThreads) {
-        const uint32_t x = id * threadStep;
+        const uint32_t x = (id * threadStep) + 1;
 
         // Loop through arrays
+        uint32_t r = 0;
         for(unsigned int i = 0; i < count; i++) {
             //d_R[(id * numThreads) + i] = (((uint64_t)x * d_A[i]) + d_B[i]) >> (32 + d_M[i]);
-            d_R[(id * numThreads) + i] = (uint32_t)__fdividef(x, 13.0f);
+            r += (uint32_t)__fdividef(d_D[i], x);
         }
+        d_R[id] = r;
     }
 }
 //-----------------------------------------------------------------------------
@@ -210,8 +221,8 @@ int main(int argc, char *argv[])
 {
     try
     {
-        unsigned int numThreads = (argc < 2) ? 2048 : std::stoul(argv[1]);
-        unsigned int numDividesPerThread = (argc < 3) ? 2048 : std::stoul(argv[2]);
+        unsigned int numThreads = (argc < 2) ? 131072 : std::stoul(argv[1]);
+        unsigned int numDividesPerThread = (argc < 3) ? 131072 : std::stoul(argv[2]);
     
         // Determine how coursely threads and loops will sample 
         unsigned int threadStep = (std::numeric_limits<uint32_t>::max() - 1) / numThreads;
@@ -224,34 +235,35 @@ int main(int argc, char *argv[])
         //------------------------------------------------------------------------
         // Create arrays to hold divisors and coefficients
         auto d = allocateHostDevice<uint32_t>(numDividesPerThread);
-        auto a = allocateHostDevice<uint32_t>(numDividesPerThread);
-        auto b = allocateHostDevice<uint32_t>(numDividesPerThread);
-        auto m = allocateHostDevice<uint32_t>(numDividesPerThread);
+        auto a = allocateHostDevice<uint32_t>(numThreads);
+        auto b = allocateHostDevice<uint32_t>(numThreads);
+        auto m = allocateHostDevice<uint32_t>(numThreads);
 
         // Allocate host array for results
         uint32_t *d_r = nullptr;
-        CHECK_CUDA_ERRORS(cudaMalloc(&d_r, numDividesPerThread * numThreads * sizeof(uint32_t)));
+        CHECK_CUDA_ERRORS(cudaMalloc(&d_r, numThreads * sizeof(uint32_t)));
 
         {
             Timer<std::milli> t("Generating input data:");
 
-            // Loop through inputs
+            // Loop through inputs and add divisors
             for(unsigned int i = 0; i < numDividesPerThread; i++) {
-                const uint32_t divisor = (i * loopStep) + 1;
+                d.first[i] = i * loopStep;
+            }
 
-                // Add divisor to array
-                d.first[i] = divisor;
+            for(unsigned int i = 0; i < numThreads; i++) {
+                uint32_t d = (i * threadStep) + 1;
 
                 // Calculate coefficients
-                std::tie(a.first[i], b.first[i], m.first[i]) = calcFastDivideConstants(divisor);
+                std::tie(a.first[i], b.first[i], m.first[i]) = calcFastDivideConstants(d);
             }
         }
         {
             Timer<std::milli> t("Uploading:");
             hostToDeviceCopy(d, numDividesPerThread);
-            hostToDeviceCopy(a, numDividesPerThread);
-            hostToDeviceCopy(b, numDividesPerThread);
-            hostToDeviceCopy(m, numDividesPerThread);
+            hostToDeviceCopy(a, numThreads);
+            hostToDeviceCopy(b, numThreads);
+            hostToDeviceCopy(m, numThreads);
         }
         dim3 threads(32, 1);
         dim3 grid(((numThreads + 31) / 32), 1);
@@ -272,13 +284,13 @@ int main(int argc, char *argv[])
         }
         {
             Timer<std::milli> t("Benchmark fast divide C:");
-            testFastDivideC<<<grid, threads>>>(a.second, b.second, m.second, d_r,
+            testFastDivideC<<<grid, threads>>>(d.second, a.second, b.second, m.second, d_r,
                                                numDividesPerThread, threadStep, numThreads);
             cudaDeviceSynchronize();
         }
         {
             Timer<std::milli> t("Benchmark fast divide PTX:");
-            testFastDividePTX<< <grid, threads >> > (a.second, b.second, m.second, d_r,
+            testFastDividePTX<< <grid, threads >> > (d.second, a.second, b.second, m.second, d_r,
                                                     numDividesPerThread, threadStep, numThreads);
             cudaDeviceSynchronize();
         }
