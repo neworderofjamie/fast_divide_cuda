@@ -11,11 +11,18 @@
 #include <vector>
 
 // Standard C includes
+#include <cassert>
 #include <cmath>
 
 // CUDA includes
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+
+extern "C"
+{
+#include "libdivide.h"
+}
+
 
 //------------------------------------------------------------------------
 // Macros
@@ -67,11 +74,22 @@ private:
     std::string m_Title;
 };
 
+__device__ __forceinline__ uint32_t cuda_mullhi_u32(uint32_t x, uint32_t y) {
+    uint64_t xl = x, yl = y;
+    uint64_t rl = xl * yl;
+    return (uint32_t)(rl >> 32);
+}
 __device__ __forceinline__ uint32_t fastDivide(uint32_t x, uint32_t a, uint32_t b, uint32_t m)
 {
     uint64_t c = b;
     asm volatile("mad.wide.u32 %0, %1, %2, %0;" : "+l"(c) : "r"(a), "r"(x));
     return (c >> (32 + m));
+}
+//-----------------------------------------------------------------------------
+__device__ __forceinline__ uint32_t cuda_u32_branchfree_do(uint32_t numer, const struct libdivide_u32_branchfree_t *denom) {
+    const uint32_t q = __umulhi(denom->magic, numer);
+    const uint32_t t = ((numer - q) >> 1) + q;
+    return t >> denom->more;
 }
 //-----------------------------------------------------------------------------
 __global__ void validateFastDivide(const uint32_t *d_D, const uint32_t *d_A, const uint32_t *d_B, const uint32_t *d_M,
@@ -80,7 +98,7 @@ __global__ void validateFastDivide(const uint32_t *d_D, const uint32_t *d_A, con
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
 
     if(id < numThreads) {
-        const uint32_t x = (id * threadStep) + 1;
+        const uint32_t x = (id * threadStep) + 2;
     
         const uint32_t a = d_A[id];
         const uint32_t b = d_B[id];
@@ -94,7 +112,28 @@ __global__ void validateFastDivide(const uint32_t *d_D, const uint32_t *d_A, con
             const uint32_t fastDivideRes = fastDivide(d_D[i], a, b, m);
            
             if(divide != fastDivideRes) {
-                printf("Divide failed for %u / %u = %u (correct answer %u)\n\ta=%u, b=%u, m=%u\n", d_D[i], x, fastDivide, divide, d_A[i], d_B[i], d_M[i]);
+                printf("FastDivide failed for %u / %u = %u (correct answer %u)\n\ta=%u, b=%u, m=%u\n", d_D[i], x, fastDivideRes, divide, d_A[i], d_B[i], d_M[i]);
+            }
+        }
+    }
+}
+//-----------------------------------------------------------------------------
+__global__ void validateLibDivide(const uint32_t *d_D, const libdivide_u32_branchfree_t *d_L,
+                                   unsigned int count, unsigned int threadStep, unsigned int numThreads)
+{
+    const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
+
+    if(id < numThreads) {
+        const uint32_t x = (id * threadStep) + 2;
+    
+        // Loop through arrays
+        for(unsigned int i = 0; i < count; i++) {
+            const uint32_t divide = d_D[i] / x;
+
+            const uint32_t fastDivideRes = cuda_u32_branchfree_do(d_D[i], d_L + id);
+           
+            if(divide != fastDivideRes) {
+                printf("LibDivide failed for %u / %u = %u (correct answer %u)\n", d_D[i], x, fastDivideRes, divide);
             }
         }
     }
@@ -106,7 +145,7 @@ __global__ void testDivide(const uint32_t *d_D, uint32_t *d_R,
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
 
     if(id < numThreads) {
-        const uint32_t x = (id * threadStep) + 1;
+        const uint32_t x = (id * threadStep) + 2;
         
         // Loop through arrays and write output
         uint32_t r = 0;
@@ -116,6 +155,7 @@ __global__ void testDivide(const uint32_t *d_D, uint32_t *d_R,
         d_R[id] = r;
     }
 }
+
 //-----------------------------------------------------------------------------
 __global__ void testFastDivideC(const uint32_t *d_D, const uint32_t *d_A, const uint32_t *d_B, const uint32_t *d_M, uint32_t *d_R,
                                 unsigned int count, unsigned int threadStep, unsigned int numThreads)
@@ -131,6 +171,21 @@ __global__ void testFastDivideC(const uint32_t *d_D, const uint32_t *d_A, const 
         uint32_t r = 0;
         for(unsigned int i = 0; i < count; i++) {
             r += (((uint64_t)d_D[i] * a) + b) >> (32 + m);
+        }
+        d_R[id] = r;
+    }
+}
+//-----------------------------------------------------------------------------
+__global__ void testLibDivide(const uint32_t *d_D, const libdivide_u32_branchfree_t *d_L, uint32_t *d_R,
+                              unsigned int count, unsigned int threadStep, unsigned int numThreads)
+{
+    const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
+
+    if(id < numThreads) {
+        // Loop through arrays
+        uint32_t r = 0;
+        for(unsigned int i = 0; i < count; i++) {
+            r += cuda_u32_branchfree_do(d_D[i], d_L + id);
         }
         d_R[id] = r;
     }
@@ -238,6 +293,7 @@ int main(int argc, char *argv[])
         auto a = allocateHostDevice<uint32_t>(numThreads);
         auto b = allocateHostDevice<uint32_t>(numThreads);
         auto m = allocateHostDevice<uint32_t>(numThreads);
+        auto l = allocateHostDevice<libdivide_u32_branchfree_t>(numThreads);
 
         // Allocate host array for results
         uint32_t *d_r = nullptr;
@@ -252,10 +308,11 @@ int main(int argc, char *argv[])
             }
 
             for(unsigned int i = 0; i < numThreads; i++) {
-                uint32_t d = (i * threadStep) + 1;
+                uint32_t d = (i * threadStep) + 2;
 
                 // Calculate coefficients
                 std::tie(a.first[i], b.first[i], m.first[i]) = calcFastDivideConstants(d);
+                l.first[i] = libdivide_u32_branchfree_gen(d);
             }
         }
         {
@@ -264,6 +321,7 @@ int main(int argc, char *argv[])
             hostToDeviceCopy(a, numThreads);
             hostToDeviceCopy(b, numThreads);
             hostToDeviceCopy(m, numThreads);
+            hostToDeviceCopy(l, numThreads);
         }
         dim3 threads(32, 1);
         dim3 grid(((numThreads + 31) / 32), 1);
@@ -273,6 +331,8 @@ int main(int argc, char *argv[])
             Timer<std::milli> t("Testing:");
         
             validateFastDivide<<<grid, threads>>>(d.second, a.second, b.second, m.second, 
+                                                  numDividesPerThread, threadStep, numThreads);
+            validateLibDivide<<<grid, threads>>>(d.second, l.second, 
                                                   numDividesPerThread, threadStep, numThreads);
             cudaDeviceSynchronize();
         }
@@ -292,6 +352,12 @@ int main(int argc, char *argv[])
             Timer<std::milli> t("Benchmark fast divide PTX:");
             testFastDividePTX<< <grid, threads >> > (d.second, a.second, b.second, m.second, d_r,
                                                     numDividesPerThread, threadStep, numThreads);
+            cudaDeviceSynchronize();
+        }
+         {
+            Timer<std::milli> t("Benchmark lib divide:");
+            testLibDivide<< <grid, threads >> > (d.second, l.second, d_r,
+                                                 numDividesPerThread, threadStep, numThreads);
             cudaDeviceSynchronize();
         }
         {
